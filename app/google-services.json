@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "120070374095",
+    "firebase_url": "https://connect-hub-242c7-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "connect-hub-242c7",
+    "storage_bucket": "connect-hub-242c7.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:120070374095:android:68b1978a70c4739a2a2dba",
+        "android_client_info": {
+          "package_name": "com.example.connect"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD0tDybPTNDItwqP6-pY4QbRa_tezq72Jw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

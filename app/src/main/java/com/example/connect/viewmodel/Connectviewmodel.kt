@@ -4,6 +4,7 @@ import android.app.Application
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.connect.data.firebase.DeviceInfo
 import com.example.connect.data.firebase.FirebaseRepository
 import com.example.connect.data.model.ConnectionStatus
 import com.example.connect.data.model.FileTransfer
@@ -30,7 +31,11 @@ data class ConnectUiState(
     val activeTransferProgress: Map<String, Float> = emptyMap(),
     val unreadNotificationCount: Int = 0,
     val bannerNotification: DeviceNotification? = null,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    // Device discovery
+    val onlineDevices: List<DeviceInfo> = emptyList(),
+    val isLoadingDevices: Boolean = false,
+    val pendingNavigationRoute: String? = null
 )
 
 // ── ViewModel ─────────────────────────────────────────────────────────────────
@@ -38,11 +43,9 @@ data class ConnectUiState(
 class ConnectViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
-        private const val PREFS_NAME = "connect_prefs"
+        private const val PREFS_NAME  = "connect_prefs"
         private const val KEY_PEER_ID = "peer_id"
     }
-
-    // ── Peer identity (stable across launches) ────────────────────────────────
 
     val selfPeerId: String by lazy {
         val prefs = application.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
@@ -55,22 +58,21 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
 
     // ── Internal state ────────────────────────────────────────────────────────
 
-    private val _deviceId  = MutableStateFlow<String?>(null)
-    private val _tunnelUrl = MutableStateFlow<String?>(null)
-    private val _errorMessage = MutableStateFlow<String?>(null)
+    private val _deviceId        = MutableStateFlow<String?>(null)
+    private val _tunnelUrl       = MutableStateFlow<String?>(null)
+    private val _errorMessage    = MutableStateFlow<String?>(null)
+    private val _onlineDevices   = MutableStateFlow<List<DeviceInfo>>(emptyList())
+    private val _isLoadingDevices = MutableStateFlow(false)
+
+
 
     // ── Managers ──────────────────────────────────────────────────────────────
 
     val webSocketManager = WebSocketManager(viewModelScope)
+    val notificationManager = NotificationManager(application)
 
-    val notificationManager = NotificationManager()
-
-    // FileTransferManager is created once we know the remote peerId (deviceId).
-    // Held in a StateFlow so the UI can react if it becomes available.
     private val _fileTransferManager = MutableStateFlow<FileTransferManager?>(null)
-
     private var messageRouter: MessageRouter? = null
-
     private val firebaseRepository = FirebaseRepository()
 
     // ── Merged UI state ───────────────────────────────────────────────────────
@@ -84,40 +86,53 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
         notificationManager.bannerNotification,
         _errorMessage
     ) { values ->
-        // combine with 7 flows gives us an Array<Any?>
         @Suppress("UNCHECKED_CAST")
         ConnectUiState(
-            connectionStatus       = values[0] as ConnectionStatus,
-            deviceId               = values[1] as String?,
-            tunnelUrl              = values[2] as String?,
-            notifications          = values[3] as List<DeviceNotification>,
+            connectionStatus        = values[0] as ConnectionStatus,
+            deviceId                = values[1] as String?,
+            tunnelUrl               = values[2] as String?,
+            notifications           = values[3] as List<DeviceNotification>,
             unreadNotificationCount = values[4] as Int,
-            bannerNotification     = values[5] as DeviceNotification?,
-            errorMessage           = values[6] as String?
+            bannerNotification      = values[5] as DeviceNotification?,
+            errorMessage            = values[6] as String?
         )
     }.stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(5_000),
+        scope        = viewModelScope,
+        started      = SharingStarted.WhileSubscribed(5_000),
         initialValue = ConnectUiState()
     )
 
-    // Transfer state is collected separately and merged into uiState via
-    // a second combine once a FileTransferManager exists.
+    private val _pendingNav = MutableStateFlow<String?>(null)
+
+    // Call this from the notification tap handler in the UI
+    fun onNotificationTapped(notification: DeviceNotification) {
+        notification.targetRoute?.let { _pendingNav.value = it }
+    }
+
+    fun consumePendingNavigation() { _pendingNav.value = null }
+
     private val _transfers = MutableStateFlow<List<FileTransfer>>(emptyList())
     private val _progress  = MutableStateFlow<Map<String, Float>>(emptyMap())
+    val pendingNavigationRoute: String? = null   // set when a notification is tapped
+
+
+
 
     val uiStateWithTransfers: StateFlow<ConnectUiState> = combine(
-        uiState,
-        _transfers,
-        _progress
-    ) { base, transfers, progress ->
+        uiState, _transfers, _progress, _onlineDevices, _isLoadingDevices, _pendingNav,
+    ) { arr ->
+        val base    = arr[0] as ConnectUiState
+        @Suppress("UNCHECKED_CAST")
         base.copy(
-            transfers             = transfers,
-            activeTransferProgress = progress
+            transfers              = arr[1] as List<FileTransfer>,
+            activeTransferProgress = arr[2] as Map<String, Float>,
+            onlineDevices          = arr[3] as List<DeviceInfo>,
+            isLoadingDevices       = arr[4] as Boolean,
+            pendingNavigationRoute = arr[5] as String?
         )
     }.stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(5_000),
+        scope        = viewModelScope,
+        started      = SharingStarted.WhileSubscribed(5_000),
         initialValue = ConnectUiState()
     )
 
@@ -125,10 +140,9 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
 
     /**
      * Called after QR scan returns a deviceId.
-     * Looks up Firebase for the tunnel URL then connects.
      */
     fun onDeviceScanned(deviceId: String) {
-        _deviceId.value = deviceId
+        _deviceId.value    = deviceId
         _errorMessage.value = null
 
         viewModelScope.launch {
@@ -147,81 +161,80 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Call from Lifecycle.Event.ON_RESUME to silently reconnect if needed.
+     * Called when the user taps a device from the online devices list.
+     * Uses the URL already stored in Firebase — no QR scan needed.
      */
-    fun reconnectIfNeeded() {
-        webSocketManager.reconnectIfNeeded()
+    fun connectToDeviceById(device: DeviceInfo) {
+        _deviceId.value     = device.deviceId
+        _tunnelUrl.value    = device.url
+        _errorMessage.value = null
+        connectToDevice(device.deviceId, device.url)
     }
 
     /**
-     * Disconnect and reset all state.
+     * Fetches the current list of online devices from Firebase.
+     * Call this when the ScanScreen becomes visible.
      */
+    fun refreshOnlineDevices() {
+        viewModelScope.launch {
+            _isLoadingDevices.value = true
+            try {
+                _onlineDevices.value = firebaseRepository.getOnlineDevices()
+            } catch (e: Exception) {
+                _errorMessage.value = "Could not load devices: ${e.message}"
+            } finally {
+                _isLoadingDevices.value = false
+            }
+        }
+    }
+
+    fun reconnectIfNeeded() = webSocketManager.reconnectIfNeeded()
+
     fun disconnect() {
         webSocketManager.disconnect()
         _fileTransferManager.value = null
-        messageRouter = null
-        _deviceId.value = null
-        _tunnelUrl.value = null
-        _transfers.value = emptyList()
-        _progress.value  = emptyMap()
+        messageRouter              = null
+        _deviceId.value            = null
+        _tunnelUrl.value           = null
+        _transfers.value           = emptyList()
+        _progress.value            = emptyMap()
         notificationManager.clear()
     }
 
-    /**
-     * Send a file to the currently connected desktop.
-     */
     fun sendFile(fileUri: Uri, mimeType: String) {
         _fileTransferManager.value?.sendFile(fileUri, mimeType)
             ?: run { _errorMessage.value = "Not connected — cannot send file." }
     }
 
-    /**
-     * Call when the user opens the Notifications tab.
-     */
     fun markNotificationsRead() = notificationManager.markAllRead()
-
-    /**
-     * Call when the slide-in banner auto-dismisses or is swiped.
-     */
-    fun dismissBanner() = notificationManager.dismissBanner()
-
-    fun clearError() { _errorMessage.value = null }
+    fun dismissBanner()         = notificationManager.dismissBanner()
+    fun clearError()            { _errorMessage.value = null }
 
     // ── Internal wiring ───────────────────────────────────────────────────────
 
     private fun connectToDevice(deviceId: String, tunnelUrl: String) {
-        // Build FileTransferManager now that we have the remote peerId
         val ftm = FileTransferManager(
-            context       = getApplication(),
-            sendEnvelope  = { envelope -> webSocketManager.send(envelope) },
-            selfPeerId    = selfPeerId,
-            remotePeerId  = deviceId
+            context      = getApplication(),
+            sendEnvelope = { envelope -> webSocketManager.send(envelope) },
+            selfPeerId   = selfPeerId,
+            remotePeerId = deviceId
         )
         _fileTransferManager.value = ftm
 
-        // Collect transfer state into our shared flows
-        viewModelScope.launch {
-            ftm.transfers.collect { _transfers.value = it }
-        }
-        viewModelScope.launch {
-            ftm.progress.collect { _progress.value = it }
-        }
+        viewModelScope.launch { ftm.transfers.collect { _transfers.value = it } }
+        viewModelScope.launch { ftm.progress.collect  { _progress.value  = it } }
 
-        // Wire up the router
         val router = MessageRouter(
-            webSocketManager  = webSocketManager,
+            webSocketManager    = webSocketManager,
             fileTransferManager = ftm,
             notificationManager = notificationManager,
-            scope             = viewModelScope
+            scope               = viewModelScope
         )
         messageRouter = router
         router.start()
 
-        // Connect the socket
         webSocketManager.connect(tunnelUrl, selfPeerId)
     }
-
-    // ── Cleanup ───────────────────────────────────────────────────────────────
 
     override fun onCleared() {
         super.onCleared()

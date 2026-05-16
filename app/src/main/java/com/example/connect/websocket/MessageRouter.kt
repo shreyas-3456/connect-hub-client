@@ -10,6 +10,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 class MessageRouter(
     private val webSocketManager: WebSocketManager,
@@ -43,7 +46,25 @@ class MessageRouter(
     private fun route(envelope: SignalEnvelope) {
         Log.d(TAG, "Routing message type=${envelope.type} from=${envelope.from}")
         when (envelope.type) {
-            TYPE_FILE_META     -> fileTransferManager.onFileMeta(envelope)
+            TYPE_FILE_META -> {
+                fileTransferManager.onFileMeta(envelope)
+                // Parse just what we need for the notification
+                try {
+                    val obj      = Json { ignoreUnknownKeys = true }
+                        .parseToJsonElement(envelope.payload).jsonObject
+                    val name     = obj["name"]!!.jsonPrimitive.content
+                    val tid      = obj["transferId"]!!.jsonPrimitive.content
+                    val sender   = envelope.from ?: "Desktop"
+                    notificationManager.addFileTransferNotification(
+                        transferId  = tid,
+                        fileName    = name,
+                        senderName  = sender,
+                        targetRoute = "files"          // matches Routes.FILES
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "file_meta notification parse error", e)
+                }
+            }
             TYPE_FILE_CHUNK    -> fileTransferManager.onFileChunk(envelope)
             TYPE_FILE_ACK      -> fileTransferManager.onFileAck(envelope)
             TYPE_FILE_PROGRESS -> fileTransferManager.onFileProgress(envelope)

@@ -1,14 +1,19 @@
 package com.example.connect
 
+import android.Manifest
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresApi
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountBox
 import androidx.compose.material.icons.filled.AddCircle
@@ -23,11 +28,13 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
@@ -35,6 +42,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.connect.data.model.ConnectionStatus
+import com.example.connect.notifications.SystemNotificationHelper
 import com.example.connect.ui.components.NotificationBanner
 import com.example.connect.ui.screens.FilesScreen
 import com.example.connect.ui.screens.HomeScreen
@@ -66,6 +74,7 @@ class MainActivity : ComponentActivity() {
     @RequiresApi(Build.VERSION_CODES.Q)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        SystemNotificationHelper.createChannel(this)
         enableEdgeToEdge()
         setContent {
             ConnectTheme {
@@ -81,6 +90,24 @@ fun ConnectApp() {
     val viewModel: ConnectViewModel = viewModel()
     val uiState by viewModel.uiStateWithTransfers.collectAsStateWithLifecycle()
     val navController = rememberNavController()
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* granted or denied — nothing to do here */ }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+    LaunchedEffect(uiState.pendingNavigationRoute) {
+        uiState.pendingNavigationRoute?.let { route ->
+            navController.navigate(route) {
+                popUpTo(Routes.HOME) { saveState = true }
+                launchSingleTop = true
+                restoreState    = true
+            }
+            viewModel.consumePendingNavigation()
+        }
+    }
 
     val currentRoute = navController
         .currentBackStackEntryAsState()
@@ -124,12 +151,22 @@ fun ConnectApp() {
                 startDestination = Routes.SCAN
             ) {
                 composable(Routes.SCAN) {
-                    ScanScreen(onDeviceScanned = { deviceId ->
-                        viewModel.onDeviceScanned(deviceId)
-                        navController.navigate(Routes.HOME) {
-                            popUpTo(Routes.SCAN) { inclusive = true }
-                        }
-                    })
+                    ScanScreen(
+                        uiState          = uiState,
+                        onDeviceScanned  = { deviceId ->
+                            viewModel.onDeviceScanned(deviceId)
+                            navController.navigate(Routes.HOME) {
+                                popUpTo(Routes.SCAN) { inclusive = true }
+                            }
+                        },
+                        onDeviceTapped   = { device ->
+                            viewModel.connectToDeviceById(device)
+                            navController.navigate(Routes.HOME) {
+                                popUpTo(Routes.SCAN) { inclusive = true }
+                            }
+                        },
+                        onRefreshDevices = { viewModel.refreshOnlineDevices() }
+                    )
                 }
                 composable(Routes.HOME) {
                     HomeScreen(
@@ -145,21 +182,20 @@ fun ConnectApp() {
                 }
                 composable(Routes.NOTIFICATIONS) {
                     NotificationsScreen(
-                        uiState    = uiState,
-                        onMarkRead = { viewModel.markNotificationsRead() }
+                        uiState              = uiState,
+                        onMarkRead           = { viewModel.markNotificationsRead() },
+                        onNotificationTapped = { viewModel.onNotificationTapped(it) }  // NEW
                     )
                 }
             }
 
-            Box(
-                modifier         = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.TopCenter
-            ) {
-                NotificationBanner(
-                    notification = uiState.bannerNotification,
-                    onDismiss    = { viewModel.dismissBanner() }
-                )
-            }
+            NotificationBanner(
+                modifier     = Modifier
+                    .align(Alignment.TopCenter)
+                    .zIndex(10f),
+                notification = uiState.bannerNotification,
+                onDismiss    = { viewModel.dismissBanner() }
+            )
         }
     }
 }

@@ -26,7 +26,8 @@ import kotlinx.coroutines.delay
 @Composable
 fun NotificationBanner(
     notification: DeviceNotification?,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    modifier:     Modifier = Modifier
 ) {
     // Auto-dismiss after 3 seconds
     LaunchedEffect(notification?.id) {
@@ -38,6 +39,7 @@ fun NotificationBanner(
 
     AnimatedVisibility(
         visible = notification != null,
+        modifier = modifier,
         enter   = slideInVertically(
             initialOffsetY = { -it },
             animationSpec  = tween(300)
@@ -63,47 +65,48 @@ fun NotificationBanner(
                 .background(Charcoal800)
                 .border(1.dp, accentColor.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
         ) {
-            // Coloured left accent bar
-            Box(
-                modifier = Modifier
-                    .width(4.dp)
-                    .fillMaxHeight()
-                    .background(accentColor)
-            )
-
-            Row(
-                modifier              = Modifier
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment     = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text       = notification.title,
-                        color      = TextPrimary,
-                        fontSize   = 14.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    if (notification.body.isNotBlank()) {
-                        Spacer(Modifier.height(2.dp))
+            // ── Accent bar — use a fixed height match via IntrinsicSize ──────
+            Row(modifier = Modifier.height(IntrinsicSize.Min)) {   // ← key change
+                Box(
+                    modifier = Modifier
+                        .width(4.dp)
+                        .fillMaxHeight()           // now safe — parent is IntrinsicSize.Min
+                        .background(accentColor)
+                )
+                Row(
+                    modifier              = Modifier
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment     = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text      = notification.body,
-                            color     = TextSecondary,
-                            fontSize  = 12.sp,
-                            lineHeight = 16.sp
+                            text       = notification.title,
+                            color      = TextPrimary,
+                            fontSize   = 14.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        if (notification.body.isNotBlank()) {
+                            Spacer(Modifier.height(2.dp))
+                            Text(
+                                text       = notification.body,
+                                color      = TextSecondary,
+                                fontSize   = 12.sp,
+                                lineHeight = 16.sp
+                            )
+                        }
+                    }
+                    IconButton(
+                        onClick  = onDismiss,
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            imageVector        = Icons.Filled.Close,
+                            contentDescription = "Dismiss",
+                            tint               = TextSecondary,
+                            modifier           = Modifier.size(16.dp)
                         )
                     }
-                }
-                IconButton(
-                    onClick  = onDismiss,
-                    modifier = Modifier.size(32.dp)
-                ) {
-                    Icon(
-                        imageVector        = Icons.Filled.Close,
-                        contentDescription = "Dismiss",
-                        tint               = TextSecondary,
-                        modifier           = Modifier.size(16.dp)
-                    )
                 }
             }
         }

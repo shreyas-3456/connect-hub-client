@@ -2,10 +2,12 @@ package com.example.connect.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -25,7 +27,8 @@ import java.util.*
 @Composable
 fun NotificationsScreen(
     uiState: ConnectUiState,
-    onMarkRead: () -> Unit
+    onMarkRead: () -> Unit,
+    onNotificationTapped: (DeviceNotification) -> Unit
 ) {
     // Clear badge as soon as screen is entered
     LaunchedEffect(Unit) {
@@ -42,14 +45,14 @@ fun NotificationsScreen(
 
         // ── Title + unread badge ──────────────────────────────────────────
         Row(
-            verticalAlignment     = Alignment.CenterVertically,
+            verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
-            modifier              = Modifier.padding(top = 16.dp)
+            modifier = Modifier.padding(top = 16.dp)
         ) {
             Text(
-                text       = "Notifications",
-                color      = TextPrimary,
-                fontSize   = 28.sp,
+                text = "Notifications",
+                color = TextPrimary,
+                fontSize = 28.sp,
                 fontWeight = FontWeight.Bold
             )
             if (uiState.unreadNotificationCount > 0) {
@@ -61,9 +64,9 @@ fun NotificationsScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text       = uiState.unreadNotificationCount.toString(),
-                        color      = Charcoal900,
-                        fontSize   = 12.sp,
+                        text = uiState.unreadNotificationCount.toString(),
+                        color = Charcoal900,
+                        fontSize = 12.sp,
                         fontWeight = FontWeight.Bold
                     )
                 }
@@ -76,7 +79,12 @@ fun NotificationsScreen(
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 items(uiState.notifications, key = { it.id }) { notification ->
-                    NotificationRow(notification = notification)
+                    NotificationRow(
+                        notification = notification,
+                        progress = notification.transferId
+                            ?.let { uiState.activeTransferProgress[it] },
+                        onClick = { onNotificationTapped(notification) }
+                    )
                 }
             }
         }
@@ -107,78 +115,65 @@ private fun EmptyNotifications() {
 
 // ── Notification row ──────────────────────────────────────────────────────────
 
-@Composable
-private fun NotificationRow(notification: DeviceNotification) {
-    val accentColor = when (notification.level) {
-        NotificationLevel.INFO  -> ElectricCyan
-        NotificationLevel.WARN  -> AmberWarning
-        NotificationLevel.ERROR -> RedError
-    }
-
-    val levelLabel = when (notification.level) {
-        NotificationLevel.INFO  -> "INFO"
-        NotificationLevel.WARN  -> "WARN"
-        NotificationLevel.ERROR -> "ERROR"
-    }
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(Charcoal800)
-            .border(1.dp, Charcoal600, RoundedCornerShape(12.dp))
+    @Composable
+    private fun NotificationRow(
+        notification: DeviceNotification,
+        progress:     Float?,          // null = not a file transfer notification
+        onClick:      () -> Unit
     ) {
-        // Coloured left accent bar
-        Box(
+        Row(
             modifier = Modifier
-                .width(4.dp)
-                .fillMaxHeight()
-                .background(accentColor)
-        )
-
-        Column(
-            modifier = Modifier
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            // ── Top row: title + level chip + timestamp ───────────────────
-            Row(
-                modifier              = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment     = Alignment.CenterVertically
-            ) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment     = Alignment.CenterVertically,
-                    modifier              = Modifier.weight(1f)
-                ) {
-                    Text(
-                        text       = notification.title,
-                        color      = TextPrimary,
-                        fontSize   = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines   = 1
-                    )
-                    LevelChip(label = levelLabel, color = accentColor)
-                }
-                Text(
-                    text     = formatTimestamp(notification.timestamp),
-                    color    = TextSecondary,
-                    fontSize = 11.sp
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(Charcoal800)
+                .border(1.dp, Charcoal600, RoundedCornerShape(12.dp))
+                .then(
+                    if (notification.targetRoute != null)
+                        Modifier.clickable(onClick = onClick)
+                    else Modifier
                 )
-            }
+        ) {
+            Box(modifier = Modifier.width(4.dp).fillMaxHeight().background(color = ElectricCyan))
 
-            // ── Body ──────────────────────────────────────────────────────
-            Text(
-                text      = notification.body,
-                color     = TextSecondary,
-                fontSize  = 13.sp,
-                lineHeight = 18.sp
-            )
+            Column(
+                modifier            = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                // existing title row + body unchanged ...
+
+                // ── Progress bar (only for file-transfer notifications) ────────
+                if (progress != null) {
+                    Spacer(Modifier.height(4.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        LinearProgressIndicator(
+                            progress    = { progress },
+                            modifier    = Modifier
+                                .fillMaxWidth()
+                                .height(4.dp)
+                                .clip(RoundedCornerShape(2.dp)),
+                            color       = ElectricCyan,
+                            trackColor  = Charcoal600,
+                        )
+                        Text(
+                            text     = if (progress >= 1f) "Complete"
+                            else "${(progress * 100).toInt()}%",
+                            color    = if (progress >= 1f) ElectricCyan else TextSecondary,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+
+                // ── "Tap to view" hint ────────────────────────────────────────
+                if (notification.targetRoute != null) {
+                    Text(
+                        text     = "Tap to view files →",
+                        color    = ElectricCyan.copy(alpha = 0.7f),
+                        fontSize = 11.sp
+                    )
+                }
+            }
         }
     }
-}
-
 // ── Level chip ────────────────────────────────────────────────────────────────
 
 @Composable

@@ -22,12 +22,16 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocketListener
 import okio.ByteString
+import java.net.InetAddress
+import java.net.UnknownHostException
 import java.security.SecureRandom
+import java.security.Security
 import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
@@ -38,33 +42,31 @@ import javax.net.ssl.X509TrustManager
  * Manages the WebSocket connection to the desktop server.
  *
  * - Connects to wss://<tunnelUrl>/signal?peerId=<peerId>
- * - Auto-reconnects with exponential backoff (1s → 2s → 4s … max 30s)
+ * - Auto-reconnects with exponential backoff, retrying up to MAX_RECONNECT_ATTEMPTS
+ *   to allow time for Cloudflare DNS propagation on new tunnel URLs
+ * - Uses a no-cache DNS resolver so stale negative DNS results don't block retries
  * - Emits received [SignalEnvelope]s on [incomingMessages]
  * - Permissive SSL trust is gated behind [BuildConfig.DEBUG] — never ships enabled
  */
-
-class WebSocketManager (
+class WebSocketManager(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-){
+) {
     companion object {
-        private const val TAG = "WebSocketManager"
+        private const val TAG = "WSM"
         private const val PATH = "/signal"
         private const val PARAM_PEER_ID = "peerId"
 
-        // Backoff constants (seconds)
-        private const val BACKOFF_INITIAL_MS = 1_000L
-        private const val BACKOFF_MAX_MS = 30_000L
-        private const val BACKOFF_MULTIPLIER = 2.0
+        // Retry for ~60 s total to allow Cloudflare DNS to propagate
+        private const val MAX_RECONNECT_ATTEMPTS = 20
+        private const val RECONNECT_INTERVAL_MS  = 3_000L
 
-        // OkHttp timeouts
         private const val CONNECT_TIMEOUT_S = 15L
-        private const val READ_TIMEOUT_S = 0L   // 0 = no timeout (server pings keep it alive)
-        private const val WRITE_TIMEOUT_S = 15L
-        private const val PING_INTERVAL_S = 20L  // client-side keepalive as belt-and-suspenders
-
+        private const val READ_TIMEOUT_S    = 0L
+        private const val WRITE_TIMEOUT_S   = 15L
+        private const val PING_INTERVAL_S   = 20L
     }
 
-    // ── State ───────
+    // ── State ─────────────────────────────────────────────────────────────────
 
     private val _connectionStatus = MutableStateFlow(ConnectionStatus.DISCONNECTED)
     val connectionStatus: StateFlow<ConnectionStatus> = _connectionStatus.asStateFlow()
@@ -75,7 +77,7 @@ class WebSocketManager (
     )
     val incomingMessages: SharedFlow<SignalEnvelope> = _incomingMessages.asSharedFlow()
 
-    // Internals
+    // ── Internals ─────────────────────────────────────────────────────────────
 
     private var webSocket: WebSocket? = null
     private var currentUrl: String? = null
@@ -93,30 +95,29 @@ class WebSocketManager (
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /**
-     * Open a WebSocket connection.
-     * Safe to call from any thread; idempotent if already connected to the same endpoint.
-     */
     fun connect(tunnelUrl: String, peerId: String) {
+        if (tunnelUrl.isBlank() || peerId.isBlank()) {
+            Log.e(TAG, "connect() aborted — tunnelUrl or peerId is blank")
+            return
+        }
+
         isIntentionallyStopped = false
-        currentUrl = tunnelUrl
+        currentUrl    = tunnelUrl
         currentPeerId = peerId
         reconnectAttempts = 0
+
         doConnect(tunnelUrl, peerId)
     }
 
-    /**
-     * Send an envelope to the server. Returns false if the socket is not open.
-     */
     fun send(envelope: SignalEnvelope): Boolean {
         val ws = webSocket
         return if (ws != null && _connectionStatus.value == ConnectionStatus.CONNECTED) {
             val payload = json.encodeToString(envelope)
             val sent = ws.send(payload)
-            if (!sent) Log.w(TAG, "send() returned false — queue full or socket closed")
+            if (!sent) Log.w(TAG, "send() — ws.send() returned false (queue full or closing)")
             sent
         } else {
-            Log.w(TAG, "send() called while not connected (status=${_connectionStatus.value})")
+            Log.w(TAG, "send() skipped — not connected")
             false
         }
     }
@@ -127,53 +128,50 @@ class WebSocketManager (
         webSocket?.close(1000, "User disconnected")
         webSocket = null
         _connectionStatus.value = ConnectionStatus.DISCONNECTED
-        Log.i(TAG, "Disconnected intentionally")
     }
 
-
-    /**
-     * Re-establish the connection using the last known URL and peerId.
-     * Useful when the app returns to the foreground (ON_RESUME).
-     */
     fun reconnectIfNeeded() {
-        val url = currentUrl ?: return
+        val url    = currentUrl    ?: return
         val peerId = currentPeerId ?: return
         if (_connectionStatus.value != ConnectionStatus.CONNECTED && !isIntentionallyStopped) {
-            Log.i(TAG, "reconnectIfNeeded() — triggering reconnect")
             doConnect(url, peerId)
         }
     }
 
-
+    // ── Internal connection logic ─────────────────────────────────────────────
 
     private fun buildWsUrl(tunnelUrl: String, peerId: String): String {
-        // Accept both https:// and wss:// prefixes from Firebase
         val base = tunnelUrl
             .replace("https://", "wss://")
-            .replace("http://", "ws://")
+            .replace("http://",  "ws://")
             .trimEnd('/')
         return "$base$PATH?$PARAM_PEER_ID=${Uri.encode(peerId)}"
     }
 
-
-
     private fun doConnect(tunnelUrl: String, peerId: String) {
+        val wsUrl = buildWsUrl(tunnelUrl, peerId)
+
         _connectionStatus.value = ConnectionStatus.CONNECTING
 
-        val wsUrl = buildWsUrl(tunnelUrl, peerId)
-        Log.i(TAG, "Connecting to $wsUrl")
+        val request = try {
+            Request.Builder().url(wsUrl).build()
+        } catch (e: Exception) {
+            Log.e(TAG, "doConnect() — malformed URL: $wsUrl", e)
+            _connectionStatus.value = ConnectionStatus.ERROR
+            scheduleReconnect(tunnelUrl, peerId)
+            return
+        }
 
-        val request = Request.Builder().url(wsUrl).build()
         webSocket = okHttpClient.newWebSocket(request, createListener(tunnelUrl, peerId))
     }
 
     private fun createListener(tunnelUrl: String, peerId: String) = object : WebSocketListener() {
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            Log.i(TAG, "WebSocket open — ${response.code}")
             this@WebSocketManager.webSocket = webSocket
             _connectionStatus.value = ConnectionStatus.CONNECTED
             reconnectAttempts = 0
+            Log.i(TAG, "Connected (peerId=$peerId)")
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
@@ -181,57 +179,49 @@ class WebSocketManager (
                 val envelope = json.decodeFromString<SignalEnvelope>(text)
                 scope.launch { _incomingMessages.emit(envelope) }
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to parse message: $text", e)
+                Log.e(TAG, "JSON parse failed: $text", e)
             }
         }
 
-        // Binary frames are not used by the protocol, but handle gracefully
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            Log.d(TAG, "Received binary frame (${bytes.size} bytes) — ignored")
+            // Binary frames not used by this protocol
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-            Log.i(TAG, "Server closing: code=$code reason=$reason")
             webSocket.close(1000, null)
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            Log.i(TAG, "WebSocket closed: code=$code reason=$reason")
             _connectionStatus.value = ConnectionStatus.DISCONNECTED
             if (!isIntentionallyStopped) scheduleReconnect(tunnelUrl, peerId)
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            Log.e(TAG, "WebSocket failure: ${t.message}", t)
+            Log.w(TAG, "onFailure() — ${t.javaClass.simpleName}: ${t.message}")
             _connectionStatus.value = ConnectionStatus.ERROR
             if (!isIntentionallyStopped) scheduleReconnect(tunnelUrl, peerId)
         }
     }
 
-
-    // ── Reconnect with exponential backoff ────────────────────────────────────
+    // ── Reconnect ─────────────────────────────────────────────────────────────
 
     private fun scheduleReconnect(tunnelUrl: String, peerId: String) {
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            Log.e(TAG, "scheduleReconnect() — giving up after $MAX_RECONNECT_ATTEMPTS attempts")
+            _connectionStatus.value = ConnectionStatus.ERROR
+            return
+        }
+
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
-            val delayMs = calculateBackoffDelay()
-            Log.i(TAG, "Reconnect attempt #${reconnectAttempts + 1} in ${delayMs}ms")
-            delay(delayMs)
+            Log.i(TAG, "Reconnecting in ${RECONNECT_INTERVAL_MS}ms (attempt ${reconnectAttempts + 1}/$MAX_RECONNECT_ATTEMPTS)")
+            delay(RECONNECT_INTERVAL_MS)
             if (!isIntentionallyStopped && isActive) {
                 reconnectAttempts++
                 doConnect(tunnelUrl, peerId)
             }
         }
     }
-
-    private fun calculateBackoffDelay(): Long {
-        val raw = (BACKOFF_INITIAL_MS * Math.pow(BACKOFF_MULTIPLIER, reconnectAttempts.toDouble())).toLong()
-        return raw.coerceAtMost(BACKOFF_MAX_MS)
-    }
-
-
-
-
 
     // ── OkHttpClient ──────────────────────────────────────────────────────────
 
@@ -241,16 +231,17 @@ class WebSocketManager (
             .readTimeout(READ_TIMEOUT_S, TimeUnit.SECONDS)
             .writeTimeout(WRITE_TIMEOUT_S, TimeUnit.SECONDS)
             .pingInterval(PING_INTERVAL_S, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(false) // We handle reconnects ourselves
+            .retryOnConnectionFailure(false)
+            // Bypass Android's aggressive negative-DNS cache so each retry
+            // does a fresh lookup — essential for new Cloudflare tunnel URLs
+            // whose DNS hasn't propagated yet.
+            .dns(FreshDns)
 
-        // Permissive SSL for local/dev fallback ONLY.
-        // Cloudflare provides valid certs in production — this path is never hit there.
-        // ⚠️  NEVER set DEBUG = true in a release build.
         if (BuildConfig.DEBUG) {
             try {
                 val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
-                    override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) = Unit
-                    override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) = Unit
+                    override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+                    override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
                     override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
                 })
                 val sslContext = SSLContext.getInstance("TLS").apply {
@@ -259,25 +250,39 @@ class WebSocketManager (
                 builder
                     .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as X509TrustManager)
                     .hostnameVerifier { _, _ -> true }
-                Log.w(TAG, " Permissive SSL active — DEBUG build only")
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to install permissive SSL", e)
+                Log.e(TAG, "Failed to install debug SSL", e)
             }
         }
 
         return builder.build()
     }
 
-    /**
-     * Call this from your DI teardown or when the app process is ending.
-     * Cancels all coroutines and closes the socket.
-     */
     fun teardown() {
         disconnect()
         scope.cancel()
         okHttpClient.dispatcher.executorService.shutdown()
     }
 
+    // ── Fresh DNS resolver ────────────────────────────────────────────────────
+
+    /**
+     * Clears the JVM's DNS cache before each lookup so that a previously
+     * failed resolution (EAI_NODATA) doesn't block subsequent retry attempts
+     * while Cloudflare propagates the new tunnel subdomain.
+     */
+    private object FreshDns : Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+            // TTL=0 tells the JVM not to cache the result (positive or negative)
+            Security.setProperty("networkaddress.cache.ttl",          "0")
+            Security.setProperty("networkaddress.cache.negative.ttl", "0")
+            return try {
+                InetAddress.getAllByName(hostname).toList()
+            } catch (e: UnknownHostException) {
+                throw e  // let OkHttp handle it; scheduleReconnect will retry
+            }
+        }
+    }
 }
 
 private object Uri {

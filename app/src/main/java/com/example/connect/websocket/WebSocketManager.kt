@@ -62,7 +62,7 @@ class WebSocketManager(
 
         private const val CONNECT_TIMEOUT_S = 15L
         private const val READ_TIMEOUT_S    = 0L
-        private const val WRITE_TIMEOUT_S   = 15L
+        private const val WRITE_TIMEOUT_S = 0L
         private const val PING_INTERVAL_S   = 20L
     }
 
@@ -118,6 +118,17 @@ class WebSocketManager(
             sent
         } else {
             Log.w(TAG, "send() skipped — not connected")
+            false
+        }
+    }
+    fun sendBinary(bytes: okio.ByteString): Boolean {
+        val ws = webSocket
+        return if (ws != null && _connectionStatus.value == ConnectionStatus.CONNECTED) {
+            val sent = ws.send(bytes)
+            if (!sent) Log.w(TAG, "sendBinary() — queue full or closing")
+            sent
+        } else {
+            Log.w(TAG, "sendBinary() skipped — not connected")
             false
         }
     }
@@ -230,7 +241,6 @@ class WebSocketManager(
             .connectTimeout(CONNECT_TIMEOUT_S, TimeUnit.SECONDS)
             .readTimeout(READ_TIMEOUT_S, TimeUnit.SECONDS)
             .writeTimeout(WRITE_TIMEOUT_S, TimeUnit.SECONDS)
-            .pingInterval(PING_INTERVAL_S, TimeUnit.SECONDS)
             .retryOnConnectionFailure(false)
             // Bypass Android's aggressive negative-DNS cache so each retry
             // does a fresh lookup — essential for new Cloudflare tunnel URLs

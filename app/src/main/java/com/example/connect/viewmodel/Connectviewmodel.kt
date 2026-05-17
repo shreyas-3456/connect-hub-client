@@ -2,6 +2,8 @@ package com.example.connect.viewmodel
 
 import android.app.Application
 import android.net.Uri
+import android.os.Build
+import androidx.annotation.RequiresApi
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.connect.data.firebase.DeviceInfo
@@ -141,6 +143,7 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
     /**
      * Called after QR scan returns a deviceId.
      */
+    @RequiresApi(Build.VERSION_CODES.Q)
     fun onDeviceScanned(deviceId: String) {
         _deviceId.value    = deviceId
         _errorMessage.value = null
@@ -164,6 +167,7 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
      * Called when the user taps a device from the online devices list.
      * Uses the URL already stored in Firebase — no QR scan needed.
      */
+    @RequiresApi(Build.VERSION_CODES.Q)
     fun connectToDeviceById(device: DeviceInfo) {
         _deviceId.value     = device.deviceId
         _tunnelUrl.value    = device.url
@@ -212,12 +216,14 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
 
     // ── Internal wiring ───────────────────────────────────────────────────────
 
+    @RequiresApi(Build.VERSION_CODES.Q)
     private fun connectToDevice(deviceId: String, tunnelUrl: String) {
         val ftm = FileTransferManager(
-            context      = getApplication(),
-            sendEnvelope = { envelope -> webSocketManager.send(envelope) },
-            selfPeerId   = selfPeerId,
-            remotePeerId = deviceId
+            context         = getApplication(),
+            sendEnvelope    = { envelope -> webSocketManager.send(envelope) },
+            sendBinaryFrame = { bytes   -> webSocketManager.sendBinary(bytes) },
+            selfPeerId      = selfPeerId,
+            remotePeerId    = deviceId
         )
         _fileTransferManager.value = ftm
 

@@ -23,19 +23,22 @@ import com.example.connect.model.TransferStatus
 import java.io.InputStream
 import android.util.Base64
 import androidx.annotation.RequiresApi
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 
 class FileTransferManager(
-    private val context: Context,
-    private val sendEnvelope: (SignalEnvelope) -> Unit,
-    private val selfPeerId: String,
-    private val remotePeerId: String,
-    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val context:         Context,
+    private val sendEnvelope:    (SignalEnvelope) -> Unit,
+    private val sendBinaryFrame: (okio.ByteString) -> Unit,
+    private val selfPeerId:      String,
+    private val remotePeerId:    String,
+    private val scope:           CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 ) {
     companion object {
         private const val TAG = "FileTransferManager"
-        private const val CHUNK_SIZE = 32 * 1024   // 32 KB
+        private const val CHUNK_SIZE = 32 * 1024
         private const val DOWNLOADS_SUBFOLDER = "Connect"
     }
 
@@ -53,16 +56,15 @@ class FileTransferManager(
 
     fun sendFile(fileUri: Uri, mimeType: String) {
         scope.launch {
+            val transferId = UUID.randomUUID().toString()
             try {
-                val cr         = context.contentResolver
-                val fileName   = resolveFileName(fileUri) ?: "file_${System.currentTimeMillis()}"
-                val fileSize   = resolveFileSize(fileUri)
-                val transferId = UUID.randomUUID().toString()
-                val stream     = cr.openInputStream(fileUri) ?: run {
+                val cr          = context.contentResolver
+                val fileName    = resolveFileName(fileUri) ?: "file_${System.currentTimeMillis()}"
+                val fileSize    = resolveFileSize(fileUri)
+                val stream      = cr.openInputStream(fileUri) ?: run {
                     Log.e(TAG, "Cannot open input stream for $fileUri")
                     return@launch
                 }
-
                 val totalChunks = calculateTotalChunks(fileSize)
 
                 addTransfer(FileTransfer(
@@ -76,47 +78,62 @@ class FileTransferManager(
                     sentChunks  = 0
                 ))
 
-                // Progress starts at 0 — will be updated by server's file_progress signals
                 updateProgress(transferId, 0, totalChunks)
 
-                val metaPayload = """{"name":"$fileName","size":$fileSize,"mimeType":"$mimeType","totalChunks":$totalChunks,"transferId":"$transferId"}"""
-                sendEnvelope(buildEnvelope("file_meta", metaPayload))
+                // ── Send file_meta as text frame (pure JSON, safe UTF-8) ──────
+                val metaPayload = buildJsonObject {
+                    put("name",        fileName)
+                    put("size",        fileSize)
+                    put("mimeType",    mimeType)
+                    put("totalChunks", totalChunks)
+                    put("transferId",  transferId)
+                }.toString()
+                sendEnvelope(buildEnvelope("file_meta", metaPayload))   // ← was missing
 
+                // ── Send chunks as binary frames ──────────────────────────────
                 stream.use { sendChunks(it, transferId, totalChunks) }
 
             } catch (e: Exception) {
-                Log.e(TAG, "sendFile failed", e)
+                Log.e(TAG, "sendFile failed: ${e.message}", e)
+                updateTransferStatus(transferId, TransferStatus.FAILED)
+                updateProgress(transferId, 0, 1)
             }
         }
     }
 
+    // Binary frame format: [4B tidLen][tid UTF-8][4B index][1B isLast][raw chunk]
     private fun sendChunks(stream: InputStream, transferId: String, totalChunks: Int) {
-        val buffer = ByteArray(CHUNK_SIZE)
-        var index  = 0
-        var bytesRead: Int
+        try {
+            val tidBytes = transferId.toByteArray(Charsets.UTF_8)
+            val buffer   = ByteArray(CHUNK_SIZE)
+            var index    = 0
+            var bytesRead: Int
 
-        while (stream.read(buffer).also { bytesRead = it } != -1) {
-            val chunk   = buffer.copyOf(bytesRead)
-            val encoded = Base64.encodeToString(chunk, Base64.NO_WRAP)
-            val isLast  = (index == totalChunks - 1)
+            while (stream.read(buffer).also { bytesRead = it } != -1) {
+                val chunk  = buffer.copyOf(bytesRead)
+                val isLast = (index == totalChunks - 1)
 
-            val chunkPayload = """{"transferId":"$transferId","index":$index,"data":"$encoded","last":$isLast}"""
-            sendEnvelope(buildEnvelope("file_chunk", chunkPayload))
+                val frame = java.io.ByteArrayOutputStream()
+                val dos   = java.io.DataOutputStream(frame)
+                dos.writeInt(tidBytes.size)
+                dos.write(tidBytes)
+                dos.writeInt(index)
+                dos.writeByte(if (isLast) 1 else 0)
+                dos.write(chunk)
+                dos.flush()
 
-            // NOTE: we do NOT update progress here for uploads.
-            // Progress is updated when the server sends back file_progress signals,
-            // so the bar reflects actual receipt, not just what we've sent.
-            index++
+                sendBinaryFrame(okio.ByteString.of(*frame.toByteArray()))
+                index++
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "sendChunks failed for $transferId: ${e.message}", e)
+            updateTransferStatus(transferId, TransferStatus.FAILED)
+            throw e
         }
     }
 
-    // ── Incoming progress from server (upload direction) ───────────────────
+    // ── Incoming progress from server (upload direction) ──────────────────────
 
-    /**
-     * Called when the server sends a file_progress envelope back.
-     * This is the source of truth for upload progress — it reflects
-     * how many chunks the server has actually received and stored.
-     */
     fun onFileProgress(envelope: SignalEnvelope) {
         try {
             val obj        = json.parseToJsonElement(envelope.payload).jsonObject
@@ -186,7 +203,6 @@ class FileTransferManager(
             buffer.chunks[index] = Base64.decode(data, Base64.NO_WRAP)
 
             val received = buffer.chunks.size
-            // Download progress is local — we know exactly what we've received
             updateProgress(transferId, received, buffer.totalChunks)
             updateSentChunks(transferId, received)
 
@@ -211,7 +227,6 @@ class FileTransferManager(
             val newStatus = if (status == "ok") TransferStatus.COMPLETED else TransferStatus.FAILED
             updateTransferStatus(transferId, newStatus)
 
-            // On successful ack, snap progress to 100%
             if (status == "ok") {
                 val transfer = _transfers.value.find { it.id == transferId }
                 if (transfer != null) {
